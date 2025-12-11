@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[15]:
+# In[1]:
 
 
 from __future__ import annotations
 
+import copy
 import random
 from dataclasses import dataclass
 from typing import Tuple, Dict, List
@@ -21,7 +22,9 @@ from torchdiffeq import odeint
 import torchcde  # may be unused but kept for completeness
 
 
-# In[16]:
+# ## **Data generation**
+
+# In[2]:
 
 
 def set_seed(seed: int = 1337) -> None:
@@ -42,25 +45,48 @@ class NSConfig:
     train_frac: float = 0.6
     val_frac: float = 0.2  # test_frac = 1 - train_frac - val_frac
 
+    # Training budget control (fairness)
+    fair_total_updates: int = 6000  # approximate target gradient updates per model
+
+    # OLFM default training config (used if not overridden in search)
     olfm_fm_epochs: int = 300
     olfm_finetune_epochs: int = 100
+    olfm_patience: int = 20
+
+    # Baseline training config
     baseline_epochs: int = 200
     baseline_patience: int = 30
+
+    # Seeds (will be overridden per outer seed in main)
+    dataset_seed: int = 1337
+    split_seed: int = 1338
+    model_seed: int = 1339
+
+    # Multi seed experiment
+    num_seeds: int = 3
+
+    # Hyperparameter search
+    hp_trials_per_model: int = 1
+
+    # Parameter efficiency tradeoff exponent alpha for CAE and relative efficiency
+    param_eff_alpha: float = 0.5
 
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
+# elif torch.backends.mps.is_available():
+#     DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
 
+# Initial seeding, will be overridden inside main loops
 set_seed(1337)
+torch.autograd.set_detect_anomaly(True)
 
 
-# ## **Data generation**
+# ## **Dataset and splits**
 
-# In[17]:
+# In[3]:
 
 
 def generate_initial_vorticity(nx: int, rng: np.random.Generator | None = None) -> np.ndarray:
@@ -93,7 +119,7 @@ def generate_initial_vorticity(nx: int, rng: np.random.Generator | None = None) 
 
 
 def simulate_ns_2d(w0: np.ndarray, *, horizon: float, dt: float, nu: float) -> np.ndarray:
-    """Solve 2D Navier–Stokes (vorticity form) on the periodic unit square."""
+    """Solve 2D Navier-Stokes (vorticity form) on the periodic unit square."""
     nx = w0.shape[0]
     nk = nx // 2 + 1
     w_hat = np.fft.rfft2(w0)
@@ -134,11 +160,11 @@ def simulate_ns_2d(w0: np.ndarray, *, horizon: float, dt: float, nu: float) -> n
 
 
 def build_dataset(cfg: NSConfig) -> Tuple[np.ndarray, np.ndarray]:
-    """Build dataset of Navier–Stokes initial and final vorticity fields."""
+    """Build dataset of Navier-Stokes initial and final vorticity fields."""
     initials: List[np.ndarray] = []
     finals: List[np.ndarray] = []
 
-    rng = np.random.default_rng(seed=1337)
+    rng = np.random.default_rng(seed=cfg.dataset_seed)
     for _ in range(cfg.samples):
         w0 = generate_initial_vorticity(cfg.grid_size, rng=rng)
         wT = simulate_ns_2d(w0, horizon=cfg.horizon, dt=cfg.time_step, nu=cfg.viscosity)
@@ -148,9 +174,7 @@ def build_dataset(cfg: NSConfig) -> Tuple[np.ndarray, np.ndarray]:
     return np.asarray(initials), np.asarray(finals)
 
 
-# # **Dataset and splits**
-
-# In[18]:
+# In[4]:
 
 
 def encode_field(u_phys: np.ndarray) -> np.ndarray:
@@ -171,7 +195,7 @@ def decode_latent(latent: np.ndarray, nx: int) -> np.ndarray:
     return z.reshape(B, nx, nx)
 
 
-# In[19]:
+# In[5]:
 
 
 class NSDataset(Dataset):
@@ -191,7 +215,8 @@ class NSDataset(Dataset):
 
 def make_splits(cfg: NSConfig, initials: np.ndarray, finals: np.ndarray):
     N = initials.shape[0]
-    indices = np.random.permutation(N)
+    rng = np.random.default_rng(seed=cfg.split_seed)
+    indices = rng.permutation(N)
 
     n_train = int(cfg.train_frac * N)
     n_val = int(cfg.val_frac * N)
@@ -228,7 +253,7 @@ def make_splits(cfg: NSConfig, initials: np.ndarray, finals: np.ndarray):
 
 # ## **OLFM**
 
-# In[20]:
+# In[6]:
 
 
 class TinyMLP(nn.Module):
@@ -264,7 +289,8 @@ class SpectralOperator2D(nn.Module):
 
     def forward(self, z_flat: torch.Tensor, t_scalar: torch.Tensor) -> torch.Tensor:
         B = z_flat.shape[0]
-        u_phys = z_flat.view(B, self.nx, self.nx)
+
+        u_phys = z_flat.reshape(B, self.nx, self.nx)
         w_hat = torch.fft.rfft2(u_phys)
 
         kx = torch.fft.rfftfreq(self.nx, 1.0 / self.nx, device=z_flat.device)
@@ -275,7 +301,9 @@ class SpectralOperator2D(nn.Module):
         KY = KY / (self.nx / 2.0)
 
         grid = torch.stack([KX, KY], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
-        t_map = t_scalar.view(B, 1, 1, 1).expand(B, self.nx, self.nk, 1)
+
+        # Reshape t safely
+        t_map = t_scalar.reshape(B, 1, 1, 1).expand(B, self.nx, self.nk, 1)
         inp = torch.cat([grid, t_map], dim=-1)
 
         Ar_i = self.A_mlp(inp)
@@ -382,7 +410,8 @@ def train_flow_matching(
             z0_b, zT_b = z0[idx], zT[idx]
 
             t = torch.rand(len(idx), device=z0.device)
-            zt = (1.0 - t.view(-1, 1)) * z0_b + t.view(-1, 1) * zT_b
+            t_col = t.unsqueeze(1)  # [batch, 1]
+            zt = (1.0 - t_col) * z0_b + t_col * zT_b
             target_v = zT_b - z0_b
 
             pred_v = model(zt, t)
@@ -422,7 +451,7 @@ def finetune_olfm_with_rollout(
     dt = 1.0 / steps
     mse_loss = nn.MSELoss()
 
-    history: Dict[str, List[float]] = {"train_fm": [], "train_rollout": [], "val_mse": []}
+    history: Dict[str, List[float]] = {"train_fm": [], "train_rollout": [], "val_mse": [], "best_val": []}
 
     best_val = float("inf")
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -441,7 +470,8 @@ def finetune_olfm_with_rollout(
 
             # Flow matching term
             t_batch = torch.rand(z0_b.shape[0], device=z0_b.device)
-            zt_batch = (1.0 - t_batch.view(-1, 1)) * z0_b + t_batch.view(-1, 1) * zT_b
+            t_col = t_batch.unsqueeze(1)
+            zt_batch = (1.0 - t_col) * z0_b + t_col * zT_b
             target_velocity = zT_b - z0_b
             loss_fm = torch.mean((model(zt_batch, t_batch) - target_velocity) ** 2)
 
@@ -502,7 +532,13 @@ def finetune_olfm_with_rollout(
         model.train()
 
     model.load_state_dict(best_state)
+    history["best_val"].append(best_val)
     return history
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def train_olfm(
@@ -511,6 +547,11 @@ def train_olfm(
     train_uT: np.ndarray,
     val_u0: np.ndarray,
     val_uT: np.ndarray,
+    hidden: int = 128,
+    lr: float = 1e-3,
+    fm_epochs: int | None = None,
+    finetune_epochs: int | None = None,
+    model_name: str = "OLFM",
 ) -> Tuple[SpectralOperator2D, Dict[str, List[float]]]:
     nx = cfg.grid_size
     z0_train = torch.tensor(encode_field(train_u0), dtype=torch.float32, device=DEVICE)
@@ -518,8 +559,14 @@ def train_olfm(
     z0_val = torch.tensor(encode_field(val_u0), dtype=torch.float32, device=DEVICE)
     zT_val = torch.tensor(encode_field(val_uT), dtype=torch.float32, device=DEVICE)
 
-    model = SpectralOperator2D(nx=nx, hidden=128).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    if fm_epochs is None:
+        fm_epochs = cfg.olfm_fm_epochs
+    if finetune_epochs is None:
+        finetune_epochs = cfg.olfm_finetune_epochs
+
+    model = SpectralOperator2D(nx=nx, hidden=hidden).to(DEVICE)
+    print(f"{model_name} params: {count_parameters(model)}")
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     print("Training OLFM (flow matching stage)...")
     fm_losses = train_flow_matching(
@@ -527,7 +574,7 @@ def train_olfm(
         opt,
         z0_train,
         zT_train,
-        epochs=cfg.olfm_fm_epochs,
+        epochs=fm_epochs,
         batch_size=cfg.batch_size,
     )
 
@@ -539,10 +586,10 @@ def train_olfm(
         zT_train,
         z0_val,
         zT_val,
-        epochs=cfg.olfm_finetune_epochs,
+        epochs=finetune_epochs,
         batch_size=cfg.batch_size,
         steps=20,
-        patience=20,
+        patience=cfg.olfm_patience,
     )
 
     history: Dict[str, List[float]] = {
@@ -550,13 +597,14 @@ def train_olfm(
         "train_fm": history_ft["train_fm"],
         "train_rollout": history_ft["train_rollout"],
         "val_mse": history_ft["val_mse"],
+        "best_val": history_ft["best_val"],
     }
     return model, history
 
 
 # ## **Latent ODE**
 
-# In[21]:
+# In[7]:
 
 
 class LatentODEFunc(nn.Module):
@@ -589,7 +637,7 @@ class LatentODEModel(nn.Module):
 
 # ## **Neural CDE**
 
-# In[22]:
+# In[8]:
 
 
 class CDEFunc(nn.Module):
@@ -662,7 +710,7 @@ class NeuralCDEModel(nn.Module):
 
 # ## **FNO**
 
-# In[23]:
+# In[9]:
 
 
 class SpectralConv2d(nn.Module):
@@ -739,8 +787,10 @@ class FNO2d(nn.Module):
     def get_grid(self, batchsize: int, size_x: int, size_y: int, device: torch.device) -> torch.Tensor:
         x = torch.linspace(0, 1, size_x, device=device)
         y = torch.linspace(0, 1, size_y, device=device)
-        gridx = x.view(1, 1, size_x, 1).repeat(batchsize, 1, 1, size_y)
-        gridy = y.view(1, 1, 1, size_y).repeat(batchsize, 1, size_x, 1)
+
+        gridx = x.reshape(1, 1, size_x, 1).repeat(batchsize, 1, 1, size_y)
+        gridy = y.reshape(1, 1, 1, size_y).repeat(batchsize, 1, size_x, 1)
+
         return torch.cat((gridx, gridy), dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -750,9 +800,9 @@ class FNO2d(nn.Module):
         grid = self.get_grid(batchsize, size_x, size_y, device)
         x = torch.cat([x, grid], dim=1)
 
-        x = x.permute(0, 2, 3, 1)  # [B, Nx, Ny, C]
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, Nx, Ny, C]
         x = self.fc0(x)
-        x = x.permute(0, 3, 1, 2)  # [B, width, Nx, Ny]
+        x = x.permute(0, 3, 1, 2).contiguous()  # [B, width, Nx, Ny]
 
         x1 = self.conv0(x)
         x = F.gelu(x1 + self.w0(x))
@@ -766,16 +816,15 @@ class FNO2d(nn.Module):
         x1 = self.conv3(x)
         x = F.gelu(x1 + self.w3(x))
 
-        x = x.permute(0, 2, 3, 1)  # [B, Nx, Ny, width]
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, Nx, Ny, width]
         x = self.fc1(x)
         x = F.gelu(x)
         x = self.fc2(x)  # [B, Nx, Ny, out_channels]
-        x = x.permute(0, 3, 1, 2)  # [B, out_channels, Nx, Ny]
+        x = x.permute(0, 3, 1, 2).contiguous()  # [B, out_channels, Nx, Ny]
         return x
 
-
 class FNORegression(nn.Module):
-    """Wrapper to make FNO behave as flat-to-flat regression."""
+    """Wrapper to make FNO behave as flat to flat regression."""
 
     def __init__(self, nx: int, modes1: int, modes2: int, width: int = 32):
         super().__init__()
@@ -790,14 +839,17 @@ class FNORegression(nn.Module):
 
     def forward(self, x0_flat: torch.Tensor) -> torch.Tensor:
         B = x0_flat.shape[0]
-        u0 = x0_flat.view(B, 1, self.nx, self.nx)
+        # Safe reshape from [B, Nx*Nx] to [B, 1, Nx, Nx]
+        u0 = x0_flat.reshape(B, 1, self.nx, self.nx)
+
         uT_pred = self.model(u0)
-        return uT_pred.view(B, -1)
+        # Safe flatten back to [B, Nx*Nx]
+        return uT_pred.reshape(B, -1)
 
 
 # ## **Training**
 
-# In[24]:
+# In[10]:
 
 
 def train_regression_model(
@@ -809,6 +861,7 @@ def train_regression_model(
     lr: float = 1e-3,
 ) -> Dict[str, List[float]]:
     model.to(DEVICE)
+    print(f"{model_name} params: {count_parameters(model)}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
 
@@ -874,7 +927,7 @@ def train_regression_model(
 
     model.load_state_dict(best_state)
     model.to(DEVICE)
-    return {"train_loss": train_losses, "val_loss": val_losses}
+    return {"train_loss": train_losses, "val_loss": val_losses, "best_val": [best_val]}
 
 
 def evaluate_flat_model(
@@ -922,9 +975,216 @@ def evaluate_olfm_model(
     return mse_all, preds_all, trues_all
 
 
+# ## **Hyperparameter search wrappers**
+
+# In[11]:
+
+
+def train_olfm_with_search(
+    cfg: NSConfig,
+    train_u0: np.ndarray,
+    train_uT: np.ndarray,
+    val_u0: np.ndarray,
+    val_uT: np.ndarray,
+    total_epochs: int,
+) -> Tuple[SpectralOperator2D, Dict[str, List[float]], Dict]:
+    """Hyperparameter search for OLFM under a fixed epoch budget."""
+    search_space = [
+        {"hidden": 64, "lr": 1e-3, "fm_frac": 0.5},
+        {"hidden": 128, "lr": 1e-3, "fm_frac": 0.7},
+        {"hidden": 256, "lr": 1e-3, "fm_frac": 0.7},
+        {"hidden": 128, "lr": 5e-4, "fm_frac": 0.5},
+    ]
+    num_trials = min(cfg.hp_trials_per_model, len(search_space))
+    candidates = random.sample(search_space, num_trials) if num_trials < len(search_space) else search_space
+
+    best_val = float("inf")
+    best_model: SpectralOperator2D | None = None
+    best_hist: Dict[str, List[float]] | None = None
+    best_hps: Dict | None = None
+
+    for trial_idx, hps in enumerate(candidates):
+        print(f"\n[OLFM] Hyperparam trial {trial_idx + 1}/{num_trials}, hps={hps}")
+        set_seed(cfg.model_seed + 100 * trial_idx)
+
+        fm_epochs = max(1, int(total_epochs * hps["fm_frac"]))
+        ft_epochs = max(1, total_epochs - fm_epochs)
+        model, hist = train_olfm(
+            cfg,
+            train_u0,
+            train_uT,
+            val_u0,
+            val_uT,
+            hidden=hps["hidden"],
+            lr=hps["lr"],
+            fm_epochs=fm_epochs,
+            finetune_epochs=ft_epochs,
+            model_name="OLFM",
+        )
+        current_val = hist["best_val"][-1]
+        print(f"[OLFM] Trial val MSE: {current_val:.4e}")
+        if current_val < best_val:
+            best_val = current_val
+            best_model = model
+            best_hist = hist
+            best_hps = {**hps, "fm_epochs": fm_epochs, "ft_epochs": ft_epochs}
+
+    assert best_model is not None and best_hist is not None and best_hps is not None
+    print(f"\n[OLFM] Selected hyperparameters: {best_hps}, best val MSE={best_val:.4e}")
+    return best_model, best_hist, best_hps
+
+
+def train_latent_ode_with_search(
+    cfg: NSConfig,
+    input_dim: int,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+) -> Tuple[LatentODEModel, Dict[str, List[float]], Dict]:
+    search_space = [
+        {"latent_dim": 128, "hidden_dim": 128, "lr": 1e-3},
+        {"latent_dim": 256, "hidden_dim": 256, "lr": 1e-3},
+        {"latent_dim": 256, "hidden_dim": 256, "lr": 5e-4},
+    ]
+    num_trials = min(cfg.hp_trials_per_model, len(search_space))
+    candidates = random.sample(search_space, num_trials) if num_trials < len(search_space) else search_space
+
+    best_val = float("inf")
+    best_model: LatentODEModel | None = None
+    best_hist: Dict[str, List[float]] | None = None
+    best_hps: Dict | None = None
+
+    for trial_idx, hps in enumerate(candidates):
+        print(f"\n[LatentODE] Hyperparam trial {trial_idx + 1}/{num_trials}, hps={hps}")
+        set_seed(cfg.model_seed + 200 * trial_idx)
+        model = LatentODEModel(
+            input_dim=input_dim,
+            latent_dim=hps["latent_dim"],
+            hidden_dim=hps["hidden_dim"],
+        )
+        hist = train_regression_model(
+            model,
+            train_loader,
+            val_loader,
+            cfg,
+            model_name="LatentODE",
+            lr=hps["lr"],
+        )
+        current_val = hist["best_val"][-1]
+        print(f"[LatentODE] Trial val MSE: {current_val:.4e}")
+        if current_val < best_val:
+            best_val = current_val
+            best_model = model
+            best_hist = hist
+            best_hps = hps
+
+    assert best_model is not None and best_hist is not None and best_hps is not None
+    print(f"\n[LatentODE] Selected hyperparameters: {best_hps}, best val MSE={best_val:.4e}")
+    return best_model, best_hist, best_hps
+
+
+def train_neural_cde_with_search(
+    cfg: NSConfig,
+    input_dim: int,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+) -> Tuple[NeuralCDEModel, Dict[str, List[float]], Dict]:
+    search_space = [
+        {"path_dim": 64, "hidden_dim": 128, "steps": 10, "lr": 1e-3},
+        {"path_dim": 64, "hidden_dim": 128, "steps": 20, "lr": 1e-3},
+        {"path_dim": 64, "hidden_dim": 128, "steps": 10, "lr": 5e-4},
+    ]
+    num_trials = min(cfg.hp_trials_per_model, len(search_space))
+    candidates = random.sample(search_space, num_trials) if num_trials < len(search_space) else search_space
+
+    best_val = float("inf")
+    best_model: NeuralCDEModel | None = None
+    best_hist: Dict[str, List[float]] | None = None
+    best_hps: Dict | None = None
+
+    for trial_idx, hps in enumerate(candidates):
+        print(f"\n[NeuralCDE] Hyperparam trial {trial_idx + 1}/{num_trials}, hps={hps}")
+        set_seed(cfg.model_seed + 300 * trial_idx)
+        model = NeuralCDEModel(
+            input_dim=input_dim,
+            path_dim=hps["path_dim"],
+            hidden_dim=hps["hidden_dim"],
+            output_dim=input_dim,
+            steps=hps["steps"],
+        )
+        hist = train_regression_model(
+            model,
+            train_loader,
+            val_loader,
+            cfg,
+            model_name="NeuralCDE",
+            lr=hps["lr"],
+        )
+        current_val = hist["best_val"][-1]
+        print(f"[NeuralCDE] Trial val MSE: {current_val:.4e}")
+        if current_val < best_val:
+            best_val = current_val
+            best_model = model
+            best_hist = hist
+            best_hps = hps
+
+    assert best_model is not None and best_hist is not None and best_hps is not None
+    print(f"\n[NeuralCDE] Selected hyperparameters: {best_hps}, best val MSE={best_val:.4e}")
+    return best_model, best_hist, best_hps
+
+
+def train_fno_with_search(
+    cfg: NSConfig,
+    nx: int,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+) -> Tuple[FNORegression, Dict[str, List[float]], Dict]:
+    modes_default = nx // 2
+    search_space = [
+        {"width": 32, "modes1": modes_default, "modes2": modes_default, "lr": 1e-3},
+        {"width": 48, "modes1": modes_default, "modes2": modes_default, "lr": 1e-3},
+        {"width": 32, "modes1": modes_default, "modes2": modes_default, "lr": 5e-4},
+    ]
+    num_trials = min(cfg.hp_trials_per_model, len(search_space))
+    candidates = random.sample(search_space, num_trials) if num_trials < len(search_space) else search_space
+
+    best_val = float("inf")
+    best_model: FNORegression | None = None
+    best_hist: Dict[str, List[float]] | None = None
+    best_hps: Dict | None = None
+
+    for trial_idx, hps in enumerate(candidates):
+        print(f"\n[FNO2d] Hyperparam trial {trial_idx + 1}/{num_trials}, hps={hps}")
+        set_seed(cfg.model_seed + 400 * trial_idx)
+        model = FNORegression(
+            nx,
+            modes1=hps["modes1"],
+            modes2=hps["modes2"],
+            width=hps["width"],
+        )
+        hist = train_regression_model(
+            model,
+            train_loader,
+            val_loader,
+            cfg,
+            model_name="FNO2d",
+            lr=hps["lr"],
+        )
+        current_val = hist["best_val"][-1]
+        print(f"[FNO2d] Trial val MSE: {current_val:.4e}")
+        if current_val < best_val:
+            best_val = current_val
+            best_model = model
+            best_hist = hist
+            best_hps = hps
+
+    assert best_model is not None and best_hist is not None and best_hps is not None
+    print(f"\n[FNO2d] Selected hyperparameters: {best_hps}, best val MSE={best_val:.4e}")
+    return best_model, best_hist, best_hps
+
+
 # ## **Diagnostics and plotting**
 
-# In[25]:
+# In[12]:
 
 
 def get_spectrum(w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -987,7 +1247,7 @@ def plot_mse_summary(test_mses: Dict[str, np.ndarray]) -> None:
     plt.show()
 
     plt.figure(figsize=(8, 4))
-    plt.boxplot([test_mses[k] for k in names], labels=names, showmeans=True)
+    plt.boxplot([test_mses[k] for k in names], tick_labels=names, showmeans=True)
     plt.ylabel("Test MSE")
     plt.title("Test MSE distribution")
     plt.grid(True, axis="y", alpha=0.3)
@@ -1033,7 +1293,7 @@ def plot_field_comparisons(
         plt.imshow(error, cmap="inferno")
         plt.colorbar()
 
-        plt.suptitle(f"Model {name} – sample {sample_idx}")
+        plt.suptitle(f"Model {name} - sample {sample_idx}")
         plt.tight_layout()
         plt.show()
 
@@ -1064,132 +1324,520 @@ def plot_spectrum_comparison(
     plt.tight_layout()
     plt.show()
 
+def plot_mse_summary_log(test_mses: Dict[str, np.ndarray]) -> None:
+    names = list(test_mses.keys())
+    means = [test_mses[k].mean() for k in names]
+    stds  = [test_mses[k].std()  for k in names]
+
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(names))
+    plt.bar(x, means, yerr=stds, capsize=5)
+    plt.xticks(x, names)
+    plt.yscale("log")  # <- key line
+    plt.ylabel("Test MSE (log scale)")
+    plt.title("Test MSE summary (mean ± std, log scale)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_mse_summary_zoomed(test_mses: Dict[str, np.ndarray]) -> None:
+    names = list(test_mses.keys())
+    means = np.array([test_mses[k].mean() for k in names])
+    stds  = np.array([test_mses[k].std()  for k in names])
+
+    # Original plot (all models)
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(names))
+    plt.bar(x, means, yerr=stds, capsize=5)
+    plt.xticks(x, names)
+    plt.ylabel("Test MSE")
+    plt.title("Test MSE summary (mean ± std)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    keep = names[:3] # assumes order: OLFM, LatentODE, NeuralCDE
+    k_idx = np.arange(len(keep))
+    k_means = means[:3]
+    k_stds  = stds[:3]
+
+    plt.figure(figsize=(8, 4))
+    plt.bar(k_idx, k_means, yerr=k_stds, capsize=5)
+    plt.xticks(k_idx, keep)
+    plt.ylabel("Test MSE")
+    plt.title("Test MSE summary (zoomed, excluding FNO2d)")
+    plt.ylim(0, 1.2 * (k_means + k_stds).max())
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_mse_summary_relative(test_mses: Dict[str, np.ndarray]) -> None:
+    names = list(test_mses.keys())
+    means = np.array([test_mses[k].mean() for k in names])
+    stds  = np.array([test_mses[k].std()  for k in names])
+
+    base = means[0]    # assume OLFM is first
+    rel_means = means / base
+    rel_stds  = stds  / base
+
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(names))
+    plt.bar(x, rel_means, yerr=rel_stds, capsize=5)
+    plt.axhline(1.0, linestyle="--", linewidth=1)
+    plt.xticks(x, names)
+    plt.ylabel("MSE / MSE(OLFM)")
+    plt.title("Relative Test MSE (lower is better)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# In[13]:
+
+
+def compute_param_efficiency_metrics(
+    aggregated_test_mses: Dict[str, np.ndarray],
+    all_param_counts: Dict[str, List[int]],
+    alpha: float = 0.5,
+    p_ref: float | None = None,
+) -> Dict[str, Dict]:
+    """
+    Compute parameter-aware metrics:
+      - mean MSE and RMSE (over all test samples and seeds)
+      - mean parameter count
+      - capacity adjusted error CAE_alpha = RMSE * (P / P_ref)^alpha
+      - relative efficiency vs best-RMSE model:
+          Score_alpha(m | b) = (E_b / E_m) * (P_b / P_m)^alpha
+    """
+    metrics: Dict[str, Dict] = {}
+
+    # Parameter statistics across seeds
+    param_means: Dict[str, float] = {}
+    param_stds: Dict[str, float] = {}
+    for name, counts in all_param_counts.items():
+        arr = np.asarray(counts, dtype=float)
+        param_means[name] = float(arr.mean())
+        param_stds[name] = float(arr.std()) if arr.size > 1 else 0.0
+
+    if p_ref is None:
+        # Use smallest mean parameter count as reference
+        p_ref = min(param_means.values())
+
+    # Error and efficiency metrics
+    for name, mse_vals in aggregated_test_mses.items():
+        mse_vals = np.asarray(mse_vals, dtype=float)
+        rmse_vals = np.sqrt(mse_vals)
+
+        mse_mean = float(mse_vals.mean())
+        mse_std = float(mse_vals.std())
+        rmse_mean = float(rmse_vals.mean())
+        rmse_std = float(rmse_vals.std())
+
+        P_mean = param_means[name]
+        P_std = param_stds[name]
+
+        rmse_per_M = rmse_mean / (P_mean / 1e6) if P_mean > 0.0 else float("nan")
+        cae_alpha = rmse_mean * ((P_mean / p_ref) ** alpha)
+
+        metrics[name] = {
+            "mse_mean": mse_mean,
+            "mse_std": mse_std,
+            "rmse_mean": rmse_mean,
+            "rmse_std": rmse_std,
+            "params_mean": P_mean,
+            "params_std": P_std,
+            "rmse_per_M": rmse_per_M,
+            "cae_alpha": cae_alpha,
+        }
+
+    # Relative efficiency vs best-RMSE model
+    baseline_name = min(metrics.keys(), key=lambda n: metrics[n]["rmse_mean"])
+    E_b = metrics[baseline_name]["rmse_mean"]
+    P_b = metrics[baseline_name]["params_mean"]
+
+    for name, vals in metrics.items():
+        E_m = vals["rmse_mean"]
+        P_m = vals["params_mean"]
+        if name == baseline_name:
+            score = 1.0
+        else:
+            score = (E_b / E_m) * ((P_b / P_m) ** alpha)
+        vals["relative_efficiency"] = score
+
+    metrics["_meta"] = {
+        "alpha": alpha,
+        "P_ref": p_ref,
+        "baseline": baseline_name,
+    }
+    return metrics
+
+
+def print_param_efficiency_table(metrics: Dict[str, Dict]) -> None:
+    meta = metrics.get("_meta", {})
+    alpha = meta.get("alpha", None)
+    baseline = meta.get("baseline", None)
+    if alpha is not None and baseline is not None:
+        print(f"Using alpha={alpha:.3f} for parameter penalty. "
+              f"Relative efficiency baseline (best RMSE): {baseline}")
+
+    header = (
+        f"{'Model':10s} "
+        f"{'Params(M)':>12s} "
+        f"{'RMSE':>10s} "
+        f"{'RMSE/M':>10s} "
+        f"{'CAE':>10s} "
+        f"{'RelEff':>10s}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for name, vals in metrics.items():
+        if name.startswith("_"):
+            continue
+        params_M = vals["params_mean"] / 1e6
+        rmse = vals["rmse_mean"]
+        rmse_per_M = vals["rmse_per_M"]
+        cae = vals["cae_alpha"]
+        rel = vals["relative_efficiency"]
+        print(
+            f"{name:10s} "
+            f"{params_M:12.3f} "
+            f"{rmse:10.3e} "
+            f"{rmse_per_M:10.3e} "
+            f"{cae:10.3e} "
+            f"{rel:10.3f}"
+        )
+
+
+def plot_error_vs_params(metrics: Dict[str, Dict]) -> None:
+    """Scatter plot of RMSE vs parameter count."""
+    names = [n for n in metrics.keys() if not n.startswith("_")]
+    params = np.array([metrics[n]["params_mean"] for n in names], dtype=float)
+    rmses = np.array([metrics[n]["rmse_mean"] for n in names], dtype=float)
+
+    plt.figure(figsize=(6, 4))
+    plt.scatter(params, rmses)
+    for name, x, y in zip(names, params, rmses):
+        plt.text(x, y, name, ha="center", va="bottom")
+
+    plt.xscale("log")
+    plt.xlabel("Number of parameters")
+    plt.ylabel("Test RMSE")
+    plt.title("RMSE vs parameter count")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_capacity_adjusted_error(metrics: Dict[str, Dict]) -> None:
+    """Bar plot of capacity adjusted error CAE_alpha."""
+    names = [n for n in metrics.keys() if not n.startswith("_")]
+    values = [metrics[n]["cae_alpha"] for n in names]
+
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(names))
+    plt.bar(x, values)
+    plt.xticks(x, names)
+    plt.ylabel("CAE_alpha (RMSE * (P / P_ref)^alpha)")
+    plt.title("Capacity adjusted error (lower is better)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_relative_efficiency(metrics: Dict[str, Dict]) -> None:
+    """Bar plot of relative efficiency scores vs best-RMSE baseline."""
+    meta = metrics.get("_meta", {})
+    baseline = meta.get("baseline", None)
+
+    names = [n for n in metrics.keys() if not n.startswith("_")]
+    values = [metrics[n]["relative_efficiency"] for n in names]
+
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(names))
+    plt.bar(x, values)
+    plt.axhline(1.0, linestyle="--", linewidth=1)
+    plt.xticks(x, names)
+    plt.ylabel("Relative efficiency score")
+    title = "Relative efficiency vs best-RMSE model"
+    if baseline is not None:
+        title += f" (baseline: {baseline})"
+    plt.title(title)
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 
 # ## **Benchmarking**
 
-# In[ ]:
+# In[14]:
 
 
 def main():
-    cfg = NSConfig()
+    cfg_base = NSConfig()
     print(f"Device: {DEVICE}")
-    print(f"Grid size: {cfg.grid_size}x{cfg.grid_size}")
-    print("Generating 2D Navier–Stokes dataset...")
-    initials, finals = build_dataset(cfg)
-    print("Data shape:", initials.shape)
+    print(f"Grid size: {cfg_base.grid_size}x{cfg_base.grid_size}")
 
-    (
-        train_u0,
-        train_uT,
-        val_u0,
-        val_uT,
-        test_u0,
-        test_uT,
-        train_loader,
-        val_loader,
-        test_loader,
-    ) = make_splits(cfg, initials, finals)
+    model_names = ["OLFM", "LatentODE", "NeuralCDE", "FNO2d"]
+    all_test_mses: Dict[str, List[np.ndarray]] = {name: [] for name in model_names}
+    all_param_counts: Dict[str, List[int]] = {name: [] for name in model_names}
+    param_counts: Dict[str, List[int]] = {name: [] for name in model_names}
 
-    input_dim = cfg.grid_size * cfg.grid_size
+    # Store histories and predictions from the first seed for plotting
+    baseline_histories_first: Dict[str, Dict[str, List[float]]] | None = None
+    olfm_hist_first: Dict[str, List[float]] | None = None
+    preds_flat_first: Dict[str, np.ndarray] | None = None
+    test_u0_first: np.ndarray | None = None
+    test_uT_first: np.ndarray | None = None
 
-    # ----------------------------- OLFM -----------------------------------
-    olfm_model, olfm_hist = train_olfm(cfg, train_u0, train_uT, val_u0, val_uT)
+    seed_values = list(range(cfg_base.num_seeds))
 
-    # --------------------------- Baselines --------------------------------
-    baseline_histories: Dict[str, Dict[str, List[float]]] = {}
+    for seed_idx, seed in enumerate(seed_values):
+        print("\n" + "=" * 80)
+        print(f"Outer seed {seed_idx + 1}/{len(seed_values)} (base seed {seed})")
+        print("=" * 80)
 
-    print("\nTraining Latent ODE baseline...")
-    latent_ode_model = LatentODEModel(input_dim=input_dim, latent_dim=256, hidden_dim=256)
-    hist_latent_ode = train_regression_model(
-        latent_ode_model,
-        train_loader,
-        val_loader,
-        cfg,
-        model_name="LatentODE",
-        lr=1e-3,
-    )
+        # Clone config and set seeds for this run
+        cfg = copy.deepcopy(cfg_base)
+        cfg.dataset_seed = seed
+        cfg.split_seed = seed + 100
+        cfg.model_seed = seed + 200
 
-    print("\nTraining Neural CDE baseline...")
-    neural_cde_model = NeuralCDEModel(input_dim=input_dim, path_dim=64, hidden_dim=128, output_dim=input_dim)
-    hist_neural_cde = train_regression_model(
-        neural_cde_model,
-        train_loader,
-        val_loader,
-        cfg,
-        model_name="NeuralCDE",
-        lr=1e-3,
-    )
+        set_seed(cfg.model_seed)
 
-    print("\nTraining FNO baseline...")
-    modes1 = cfg.grid_size // 2
-    modes2 = cfg.grid_size // 2
-    fno_regression_model = FNORegression(cfg.grid_size, modes1=modes1, modes2=modes2, width=32)
-    hist_fno = train_regression_model(
-        fno_regression_model,
-        train_loader,
-        val_loader,
-        cfg,
-        model_name="FNO2d",
-        lr=1e-3,
-    )
+        print("Generating 2D Navier-Stokes dataset...")
+        initials, finals = build_dataset(cfg)
+        print("Data shape:", initials.shape)
 
-    baseline_histories["LatentODE"] = hist_latent_ode
-    baseline_histories["NeuralCDE"] = hist_neural_cde
-    baseline_histories["FNO2d"] = hist_fno
-    baseline_histories["OLFM"] = olfm_hist
+        (
+            train_u0,
+            train_uT,
+            val_u0,
+            val_uT,
+            test_u0,
+            test_uT,
+            train_loader,
+            val_loader,
+            test_loader,
+        ) = make_splits(cfg, initials, finals)
 
-    # --------------------------- Evaluation -------------------------------
-    print("\nEvaluating all models on test set...")
-    olfm_mse, olfm_pred_flat, olfm_true_flat = evaluate_olfm_model(
-        olfm_model,
-        test_u0,
-        test_uT,
-        steps=100,
-    )
-    latent_mse, latent_pred_flat, latent_true_flat = evaluate_flat_model(
-        latent_ode_model,
-        test_loader,
-    )
-    cde_mse, cde_pred_flat, cde_true_flat = evaluate_flat_model(
-        neural_cde_model,
-        test_loader,
-    )
-    fno_mse, fno_pred_flat, fno_true_flat = evaluate_flat_model(
-        fno_regression_model,
-        test_loader,
-    )
+        # Match training budget in number of gradient updates
+        updates_per_epoch = len(train_loader)
+        total_epochs = max(1, cfg.fair_total_updates // max(1, updates_per_epoch))
+        cfg.baseline_epochs = total_epochs
+        print(
+            f"Using {total_epochs} epochs for all models "
+            f"(~{total_epochs * updates_per_epoch} gradient updates)"
+        )
 
-    test_mses: Dict[str, np.ndarray] = {
-        "OLFM": olfm_mse,
-        "LatentODE": latent_mse,
-        "NeuralCDE": cde_mse,
-        "FNO2d": fno_mse,
+        input_dim = cfg.grid_size * cfg.grid_size
+
+        # ----------------------------- OLFM with search -------------------
+        print("\nTraining OLFM (with hyperparameter search)...")
+        olfm_model, olfm_hist, olfm_hps = train_olfm_with_search(
+            cfg,
+            train_u0,
+            train_uT,
+            val_u0,
+            val_uT,
+            total_epochs=total_epochs,
+        )
+
+        # --------------------------- Baselines with search ----------------
+        print("\nTraining Latent ODE baseline (with hyperparameter search)...")
+        latent_ode_model, hist_latent_ode, latent_hps = train_latent_ode_with_search(
+            cfg,
+            input_dim,
+            train_loader,
+            val_loader,
+        )
+
+        print("\nTraining Neural CDE baseline (with hyperparameter search)...")
+        neural_cde_model, hist_neural_cde, cde_hps = train_neural_cde_with_search(
+            cfg,
+            input_dim,
+            train_loader,
+            val_loader,
+        )
+
+        print("\nTraining FNO baseline (with hyperparameter search)...")
+        fno_regression_model, hist_fno, fno_hps = train_fno_with_search(
+            cfg,
+            cfg.grid_size,
+            train_loader,
+            val_loader,
+        )
+
+        # Record parameter counts for the final selected models on this seed
+        params_olfm = count_parameters(olfm_model)
+        params_latent = count_parameters(latent_ode_model)
+        params_neuralcde = count_parameters(neural_cde_model)
+        params_fno = count_parameters(fno_regression_model)
+
+        param_counts["OLFM"].append(params_olfm)
+        param_counts["LatentODE"].append(params_latent)
+        param_counts["NeuralCDE"].append(params_neuralcde)
+        param_counts["FNO2d"].append(params_fno)
+
+        # Store parameter counts for this seed (after hyperparameter search)
+        param_counts_seed = {
+            "OLFM": count_parameters(olfm_model),
+            "LatentODE": count_parameters(latent_ode_model),
+            "NeuralCDE": count_parameters(neural_cde_model),
+            "FNO2d": count_parameters(fno_regression_model),
+        }
+        for name in model_names:
+            all_param_counts[name].append(param_counts_seed[name])
+
+        # Collect histories for first seed for plotting
+        if seed_idx == 0:
+            baseline_histories_first = {
+                "LatentODE": hist_latent_ode,
+                "NeuralCDE": hist_neural_cde,
+                "FNO2d": hist_fno,
+            }
+            baseline_histories_first["OLFM"] = olfm_hist
+            olfm_hist_first = olfm_hist
+            test_u0_first = test_u0
+            test_uT_first = test_uT
+
+        # --------------------------- Evaluation ---------------------------
+        print("\nEvaluating all models on test set...")
+        olfm_mse, olfm_pred_flat, _ = evaluate_olfm_model(
+            olfm_model,
+            test_u0,
+            test_uT,
+            steps=100,
+        )
+        latent_mse, latent_pred_flat, _ = evaluate_flat_model(
+            latent_ode_model,
+            test_loader,
+        )
+        cde_mse, cde_pred_flat, _ = evaluate_flat_model(
+            neural_cde_model,
+            test_loader,
+        )
+        fno_mse, fno_pred_flat, _ = evaluate_flat_model(
+            fno_regression_model,
+            test_loader,
+        )
+
+        test_mses_seed: Dict[str, np.ndarray] = {
+            "OLFM": olfm_mse,
+            "LatentODE": latent_mse,
+            "NeuralCDE": cde_mse,
+            "FNO2d": fno_mse,
+        }
+
+        for name in model_names:
+            all_test_mses[name].append(test_mses_seed[name])
+
+        if seed_idx == 0:
+            preds_flat_first = {
+                "OLFM": olfm_pred_flat,
+                "LatentODE": latent_pred_flat,
+                "NeuralCDE": cde_pred_flat,
+                "FNO2d": fno_pred_flat,
+            }
+
+        print("\nTest MSE for this seed (mean over test set):")
+        for name, mse_vals in test_mses_seed.items():
+            print(f" {name:10s}: {mse_vals.mean():.4e} ± {mse_vals.std():.4e}")
+
+    # Aggregate over seeds
+    aggregated_test_mses: Dict[str, np.ndarray] = {
+        name: np.concatenate(all_test_mses[name], axis=0) for name in model_names
     }
-    preds_flat: Dict[str, np.ndarray] = {
-        "OLFM": olfm_pred_flat,
-        "LatentODE": latent_pred_flat,
-        "NeuralCDE": cde_pred_flat,
-        "FNO2d": fno_pred_flat,
-    }
 
-    print("\nTest MSE (mean over test set):")
-    for name, mse_vals in test_mses.items():
+    print("\n" + "=" * 80)
+    print("Aggregated test MSE over all seeds (per sample, concatenated):")
+    print("=" * 80)
+    for name, mse_vals in aggregated_test_mses.items():
         print(f" {name:10s}: {mse_vals.mean():.4e} ± {mse_vals.std():.4e}")
 
-    # ----------------------------- Plots ----------------------------------
-    print("\nPlotting training and validation curves...")
-    plot_training_curves(baseline_histories)
+    # ---------------------- Parameter efficiency metrics ----------------------
+    print("\n" + "=" * 80)
+    print("Parameter efficiency metrics (aggregated over seeds):")
+    print("=" * 80)
+    metrics = compute_param_efficiency_metrics(
+        aggregated_test_mses,
+        all_param_counts,
+        alpha=cfg_base.param_eff_alpha,
+        p_ref=None,
+    )
+    print_param_efficiency_table(metrics)
 
-    print("Plotting test MSE summary across models...")
-    plot_mse_summary(test_mses)
+    # ------------------------ Parameter count summary -------------------
+    print("\n" + "=" * 80)
+    print("Parameter counts (per seed and mean):")
+    print("=" * 80)
+    mean_params: Dict[str, float] = {}
+    for name in model_names:
+        vals = np.array(param_counts[name], dtype=float)
+        mean_params[name] = vals.mean()
+        unique_vals = sorted(set(param_counts[name]))
+        if len(unique_vals) == 1:
+            print(f" {name:10s}: {unique_vals[0]:d}")
+        else:
+            print(f" {name:10s}: {param_counts[name]} (mean {vals.mean():.1f})")
 
-    sample_idx = 0
-    print(f"Plotting field comparisons for sample {sample_idx}...")
-    plot_field_comparisons(cfg, test_u0, test_uT, preds_flat, sample_idx=sample_idx)
+    base_params = mean_params["OLFM"]
+    print("\nParameter ratios relative to OLFM:")
+    for name in model_names:
+        ratio = mean_params[name] / base_params
+        print(f" {name:10s}: {ratio:8.2f} x OLFM")
 
-    print(f"Plotting spectral comparison for sample {sample_idx}...")
-    plot_spectrum_comparison(cfg, test_uT, preds_flat, sample_idx=sample_idx)
+    # ----------------------------- Plots --------------------------------
+    if baseline_histories_first is not None and olfm_hist_first is not None:
+        print("\nPlotting training and validation curves for first seed...")
+        plot_training_curves(baseline_histories_first)
 
+    # Aggregate MSE plots
+    print("Plotting aggregated test MSE summary across models (linear scale)...")
+    plot_mse_summary(aggregated_test_mses)
+
+    print("Plotting aggregated test MSE summary across models (log scale)...")
+    plot_mse_summary_log(aggregated_test_mses)
+
+    print("Plotting zoomed test MSE summary (excluding FNO2d)...")
+    plot_mse_summary_zoomed(aggregated_test_mses)
+
+    print("Plotting relative test MSE summary (normalised by OLFM)...")
+    plot_mse_summary_relative(aggregated_test_mses)
+
+    # Parameter-aware plots
+    print("Plotting RMSE vs parameter count...")
+    plot_error_vs_params(metrics)
+
+    print("Plotting capacity adjusted error...")
+    plot_capacity_adjusted_error(metrics)
+
+    print("Plotting relative efficiency scores...")
+    plot_relative_efficiency(metrics)
+
+    # Field and spectrum plots from first seed
+    if (
+        preds_flat_first is not None
+        and test_u0_first is not None
+        and test_uT_first is not None
+    ):
+        sample_idx = 0
+        print(f"Plotting field comparisons for sample {sample_idx} (first seed)...")
+        plot_field_comparisons(
+            NSConfig(grid_size=test_u0_first.shape[-1]),
+            test_u0_first,
+            test_uT_first,
+            preds_flat_first,
+            sample_idx=sample_idx,
+        )
+
+        print(f"Plotting spectral comparison for sample {sample_idx} (first seed)...")
+        plot_spectrum_comparison(
+            NSConfig(grid_size=test_uT_first.shape[-1]),
+            test_uT_first,
+            preds_flat_first,
+            sample_idx=sample_idx,
+        )
 
 if __name__ == "__main__":
     main()

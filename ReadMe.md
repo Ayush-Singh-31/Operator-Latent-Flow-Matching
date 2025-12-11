@@ -1,46 +1,27 @@
-# Operator–Latent Flow Matching (OL-FM)
+# OL-FM: Operator-Latent Flow Matching for Function-Valued Dynamics
 
-Operator–Latent Flow Matching (OL–FM) is a research framework for learning continuous-time
-dynamics when the system state is a function (e.g., fields, curves, surfaces). Observations are encoded
-into a function-space latent that evolves under an operator-valued ODE, trained via flow matching to
-deliver stable long-horizon rollouts, constraint handling, and resolution transfer.
+This repository contains the reference implementation that accompanies the paper on Operator-Latent Flow Matching (OL-FM) for learning dynamics of function-valued states. The project studies dynamical systems where each state is a function rather than a finite-dimensional vector, and introduces a latent model that evolves in a Hilbert space while respecting underlying function-space geometry.
 
-## Why OL–FM?
-- **Function-space latents:** encode observations into Sobolev/Hilbert space representations instead of
-  finite-dimensional vectors, preserving geometry and smoothness.
-- **Neural operator vector field:** evolve the latent with a spectral neural operator that can be shared
-  across resolutions and domains.
-- **Flow matching training:** regress latent velocities along carefully designed interpolation paths,
-  removing the need to backpropagate through ODE solvers and improving conditioning.
-- **Stability & constraints:** Lipschitz control in latent space enables guarantees about existence and
-  uniqueness of the latent flow, while penalties/projections can enforce structural constraints.
-- **Cross-domain versatility:** demonstrated on PDE surrogates (1D Burgers, 2D Navier–Stokes) and
-  financial term-structure dynamics with fewer constraint violations than vector-latent baselines.
+OL-FM combines neural operators with continuous-time latent dynamics and flow matching. The model represents each input field as an element of a Hilbert space and learns an operator-valued vector field that drives latent trajectories between source and target functions. Training is performed using a flow matching objective, which aligns the model’s induced probability flow with simple reference paths in latent space. This viewpoint allows OL-FM to benefit from both operator learning for partial differential equations and continuous-time latent models, while providing a more structured latent space than standard vector embeddings.
 
-## Project Structure
+The experiments in this repository evaluate OL-FM on fluid and transport benchmarks. For two-dimensional incompressible Navier–Stokes in vorticity form, OL-FM is compared against established baselines such as Fourier Neural Operators and latent vector models, with a focus on accuracy, parameter efficiency, and stability of long-horizon rollouts. For one-dimensional Burgers equations, the cross-resolution setting probes how OL-FM handles changes in spatial discretisation, highlighting its ability to work in a function-space representation rather than being tied to a fixed grid.
 
-The codebase is organized into several directories, each containing specific tests and models:
+## Repository contents
 
-- **Benchmarking/**: Contains benchmark tests (Test 02, Test 03).
-- **Cross-Resolution/**: Focuses on cross-resolution experiments (Test 01, Test 04, Test 05, Test 06, Test 08).
-- **Financial Model/**: Includes the financial model implementation (Test 07) and asset generation scripts.
-- **Gadi Tests/**: Tests specifically designed or run on the Gadi supercomputer (Test 09, Test 10).
+Benchmark.py contains the main implementation of OL-FM for the Navier–Stokes benchmark together with baseline architectures, data generation on periodic grids, training loops, and evaluation routines used in the paper. This script is the core reference for the operator-latent flow matching model in the fluid dynamics setting.
 
-## Installation
+Benchmark.ipynb is an interactive notebook that mirrors the benchmark experiments, allowing step-by-step inspection of model components, training behaviour, and diagnostic plots such as error curves, field reconstructions, and spectral summaries.
 
-To set up the environment, install the required dependencies using pip:
+Benchmark.pdf provides a static, notebook-style report for the benchmark experiments, including figures and tables used to summarise the behaviour of OL-FM and the comparison models.
 
-```bash
-pip install -r Requirements.txt
-```
+Cross Resolution.py implements the Burgers cross-resolution experiments. It focuses on learning dynamics at one spatial resolution and assessing behaviour when evaluated at a different resolution, illustrating how OL-FM operates in a discretisation-agnostic function space.
 
-## Usage
+Cross Resolution.ipynb is the corresponding notebook for the cross-resolution study, collecting the main plots and numerical results that demonstrate how the model extrapolates across grids in the Burgers setting.
 
-To run a specific test, navigate to the corresponding directory and execute the Python script. For example, to run Test 03 in the Benchmarking directory:
+Cross Resolution.pdf is a report version of the cross-resolution experiments, suitable for quick inspection of the figures and numerical summaries without running the code.
 
-```bash
-cd Benchmarking
-python "Test 03.py"
-```
+Requirements.txt lists the main Python dependencies needed to reproduce the experiments and analysis associated with the OL-FM paper.
 
-Please ensure you have the necessary data and permissions if running tests that require specific resources.
+## Intended use
+
+This repository is intended as a research reference for readers interested in operator learning, flow matching, and function-space latent models. It provides a concrete implementation of OL-FM in canonical PDE benchmarks, along with the exact scripts and notebooks that support the empirical results reported in the paper. Researchers can use it to better understand the modelling choices, experimental setup, and diagnostic checks used to evaluate operator-based latent dynamics.
